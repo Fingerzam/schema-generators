@@ -1,9 +1,10 @@
-(ns schema-generators.generators
+(ns schema-generators.scaled-generators
   "Experimental support for compiling schemas to test.check generators."
   (:require
    [clojure.test.check.generators :as generators]
    [schema.spec.core :as spec :include-macros true]
    [schema-generators.schemas :refer :all]
+   [schema-generators.schema-depth :as schema-depth]
    schema.spec.collection
    schema.spec.leaf
    schema.spec.variant
@@ -13,6 +14,8 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private helpers for composite schemas
+
+(declare scale-deep-collection-generator)
 
 (defn g-by [f & args]
   (generators/fmap
@@ -34,17 +37,97 @@
 
 (declare elements-generator)
 
+(defn basic-schema-spec-element? [schema-spec-element]
+  "A basic schema spec element is a map with the keys :schema and :parser.
+   The value behind :schema should be a valid schema."
+  (and (map? schema-spec-element)
+       (contains? schema-spec-element :schema)
+       (contains? schema-spec-element :parser)))
+
+(def schema-spec-element-tags
+  #{::schema.spec.collection/optional
+    ::schema.spec.collection/remaining})
+
+(defn tag [schema-spec-element]
+  (first schema-spec-element))
+
+(defn basic-schema-spec
+  [schema-spec-element]
+  (second schema-spec-element))
+
+(defn common-tagged-schema-spec-element?
+  [schema-spec-element]
+  (and (vector? schema-spec-element)
+       (<= 2
+           (count schema-spec-element)
+           3)
+       (contains? schema-spec-element-tags
+                  (tag schema-spec-element))
+       (basic-schema-spec-element? (basic-schema-spec schema-spec-element))))
+
+(defn simple-tagged-schema-spec-element?
+  [schema-spec-element]
+  (and (common-tagged-schema-spec-element? schema-spec-element)
+       (= 2 (count schema-spec-element))))
+
+(defn nested-tagged-schema-spec-element?
+  [schema-spec-element]
+  (and (common-tagged-schema-spec-element? schema-spec-element)
+       (= 3 (count schema-spec-element))
+       (= ::schema.spec.collection/optional
+          (tag schema-spec-element))))
+
+(defn tagged-schema-spec-element? [schema-spec-element]
+  "A valid tagged schema spec element is a two or three element vector, where
+   the first element is an element type tag (options described above) and the
+   second element is a basic-schema-spec-element and the last optional element
+   is another schema-spec-element"
+  (if-not (vector? schema-spec-element)
+    false
+    (let [len (count schema-spec-element)]
+      (if (= 2 len)
+        (simple-tagged-schema-spec-element? schema-spec-element)
+        (nested-tagged-schema-spec-element? schema-spec-element)))))
+
+(defn schema-spec-element->basic-spec [schema-spec-element]
+  (cond (tagged-schema-spec-element? schema-spec-element)
+        (basic-schema-spec schema-spec-element)
+
+        (basic-schema-spec-element? schema-spec-element)
+        schema-spec-element
+
+        :else
+        nil))
+
+(defn schema-spec-element->schema [schema-spec-element]
+  (-> schema-spec-element
+      schema-spec-element->basic-spec
+      :schema))
+
 (defn element-generator [e params]
+  (println "e:")
+  (clojure.pprint/pprint e)
+  (println)
   (if (vector? e)
     (case (first e)
-      :schema.spec.collection/optional
+      ::schema.spec.collection/optional
       (generators/one-of
        [(generators/return nil)
         (elements-generator (next e) params)])
 
-      :schema.spec.collection/remaining
+      ::schema.spec.collection/remaining
       (do (macros/assert! (= 2 (count e)) "remaining can have only one schema.")
-          (generators/vector (sub-generator (second e) params))))
+          ;; if the schema for remaining collection elements has depth of at least one,
+          ;; then a collection of them has depth of at least two and needs to be scaled
+          (let [unscaled (generators/vector (sub-generator (second e) params))
+                schema (schema-spec-element->schema e)]
+            (if (<= 1 (schema-depth/depth schema))
+              (do
+                (println "scaling schema: " (pr-str schema))
+                (scale-deep-collection-generator unscaled))
+              unscaled))
+
+          ))
     (generators/fmap vector (sub-generator e params))))
 
 (defn elements-generator [elts params]
@@ -172,6 +255,33 @@
   [m]
   (fmap #(merge % m)))
 
+(defn collection-schema? [schema]
+  "returns true if parameter schema describes a collection with arbitrary
+   amount of elements, like [Str] or
+   {:required-key Str, (optional-key :b) Int, Keyword Int}"
+  (let [spec (s/spec schema)]
+    (if (instance? schema.spec.collection.CollectionSpec spec)
+      (not (empty? (:remaining (schema-depth/spec->element-types spec))))
+      false)))
+
+(defn deep-collection-schema? [schema]
+  "Deep collections, like nested vectors, need scaling"
+  (and (collection-schema? schema)
+       (< 1 (schema-depth/depth schema))))
+
+(defn scaling-function [n]
+  (-> n
+      java.lang.Math/sqrt
+      java.lang.Math/ceil
+      int
+      (* 2)))
+
+(defn scale-deep-collection-generator [generator]
+  (generators/scale scaling-function generator))
+
+(defn scaled-composite-generator [schema params]
+  (composite-generator (s/spec schema) params))
+
 (s/defn generator :- Generator
   "Produce a test.check generator for schema.
 
@@ -191,11 +301,20 @@
            gen (fn [s params]
                  ((or (wrappers s) identity)
                   (or (leaf-generators s)
+                      (scaled-composite-generator s params)
                       (composite-generator (s/spec s) params))))]
        (generators/fmap
         (s/validator schema)
-        (gen schema {:subschema-generator gen :cache #?(:clj (java.util.IdentityHashMap.)
-                                                        :cljs (atom {}))})))))
+        (gen schema {:subschema-generator gen
+                     :cache #?(:clj (java.util.IdentityHashMap.)
+                               :cljs (atom {}))
+                     :scaled false})))))
+
+(s/defn generator-2
+  [params :- {:schema Schema
+              :leaf-generators LeafGenerators
+              :leaf-depths LeafDepths
+              :wrappers GeneratorWrappers}])
 
 (s/defn sample :- [s/Any]
   "Sample k elements from generator."
